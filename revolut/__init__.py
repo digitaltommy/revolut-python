@@ -24,6 +24,7 @@ class Client(utils._SetEnv):
     _accounts = None
     _counterparties = None
     _cptbyaccount = None
+    _payment_drafts = None
 
     def __init__(self, session):
         self._set_env(session.access_token)
@@ -52,6 +53,7 @@ class Client(utils._SetEnv):
                     raise exceptions.CounterpartyAddressRequired(message)
                 elif "ounterparty already exists" in message:
                     raise exceptions.CounterpartyAlreadyExists(message)
+            print(rsp.__dict__)
             raise exceptions.RevolutHttpError(rsp.status_code, message)
         if result:
             _ppresult = json.dumps(result, indent=2, sort_keys=True)
@@ -96,6 +98,17 @@ class Client(utils._SetEnv):
     def _refresh_counterparties(self):
         self._counterparties = self._cptbyaccount = None
         _ = self.counterparties
+
+    @property
+    def payment_drafts(self):
+        if self._payment_drafts is not None:
+            return self._payment_drafts
+        self._payment_drafts = {}
+        data = self._get("payment-drafts")
+        for pddata in data["payment_orders"]:
+            payment_draft = PaymentDraft(client=self, **pddata)
+            self._payment_drafts[payment_draft.id] = payment_draft
+        return self._payment_drafts
 
     def transactions(
         self, counterparty=None, from_date=None, to_date=None, txtype=None
@@ -219,6 +232,42 @@ class Account(_UpdateFromKwargsMixin):
             reqdata["reference"] = reference
         data = self.client._post("pay", reqdata)
         return self.client.transaction(data["id"])
+
+    def send_draft(self, dest, amount, currency, reference=None):
+        amount = Decimal(amount)
+        destid = utils._obj2id(dest)
+        if (
+            destid in self.client.accounts
+            and currency == self.currency == self.client.accounts[destid].currency
+        ):
+            return self._transfer_internal(destid, amount, request_id, reference)
+        try:
+            _ = self.client.counterparties  # NOTE: make sure counterparties are loaded
+            cpt = self.client._cptbyaccount[destid]
+        except KeyError:
+            raise ValueError(
+                "Account id {} not found among counterparties.".format(destid)
+            )
+        if cpt.accounts[destid].currency != currency:
+            raise ValueError(
+                "Currency {} does not match the destination currency: {}".format(
+                    currency, cpt.accounts[destid].currency
+                )
+            )
+        reqdata = {
+            "title": reference,
+            "payments": [
+                {
+                    "account_id": self.id,
+                    "receiver": {"account_id": destid, "counterparty_id": cpt.id},
+                    "amount": float("{:.2f}".format(amount)),
+                    "currency": currency,
+                    "reference": reference,
+                }
+            ],
+        }
+        data = self.client._post("payment-drafts", reqdata)
+        return data["id"]
 
     def _transfer_internal(self, destid, amount, request_id, reference):
         reqdata = {
@@ -462,3 +511,22 @@ class Transaction(_UpdateFromKwargsMixin):
         self.completed_at = (
             dateutil.parser.parse(self.completed_at) if self.completed_at else None
         )
+
+
+class PaymentDraft(_UpdateFromKwargsMixin):
+    id = None
+    client = None
+    type = ""
+    state = ""
+    reason_code = ""
+    reference = None
+    title = None
+    scheduled_for = None
+    payments_count = None
+
+    def __init__(self, **kwargs):
+        self.client = kwargs.pop("client")
+        self._update(**kwargs)
+
+    def __repr__(self):
+        return "<PaymentDraft {}>".format(self.id)
